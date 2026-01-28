@@ -64,6 +64,22 @@ class Meeting:
                 except (ValueError, TypeError):
                     pass
 
+        # Handle Granola's google_calendar_event.start.dateTime format
+        if 'google_calendar_event' in self._data and isinstance(self._data['google_calendar_event'], dict):
+            gce = self._data['google_calendar_event']
+            if 'start' in gce and isinstance(gce['start'], dict):
+                if 'dateTime' in gce['start']:
+                    try:
+                        return convert_utc_to_cst(gce['start']['dateTime'])
+                    except (ValueError, TypeError):
+                        pass
+            # Also handle flat structure: google_calendar_event.dateTime
+            elif 'dateTime' in gce:
+                try:
+                    return convert_utc_to_cst(gce['dateTime'])
+                except (ValueError, TypeError):
+                    pass
+
         return None
 
     @property
