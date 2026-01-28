@@ -64,6 +64,22 @@ class Meeting:
                 except (ValueError, TypeError):
                     pass
 
+        # Handle Granola's google_calendar_event.start.dateTime format
+        if 'google_calendar_event' in self._data and isinstance(self._data['google_calendar_event'], dict):
+            gce = self._data['google_calendar_event']
+            if 'start' in gce and isinstance(gce['start'], dict):
+                if 'dateTime' in gce['start']:
+                    try:
+                        return convert_utc_to_cst(gce['start']['dateTime'])
+                    except (ValueError, TypeError):
+                        pass
+            # Also handle flat structure: google_calendar_event.dateTime
+            elif 'dateTime' in gce:
+                try:
+                    return convert_utc_to_cst(gce['dateTime'])
+                except (ValueError, TypeError):
+                    pass
+
         return None
 
     @property
@@ -85,6 +101,16 @@ class Meeting:
                     return convert_utc_to_cst(end_data['dateTime'])
                 except (ValueError, TypeError):
                     pass
+
+        # Handle Granola's google_calendar_event.end.dateTime format
+        if 'google_calendar_event' in self._data and isinstance(self._data['google_calendar_event'], dict):
+            gce = self._data['google_calendar_event']
+            if 'end' in gce and isinstance(gce['end'], dict):
+                if 'dateTime' in gce['end']:
+                    try:
+                        return convert_utc_to_cst(gce['end']['dateTime'])
+                    except (ValueError, TypeError):
+                        pass
 
         return None
 
@@ -167,14 +193,26 @@ class Meeting:
         if 'start' in self._data and 'end' in self._data:
             start_data = self._data['start']
             end_data = self._data['end']
-            
+
             if isinstance(start_data, dict) and isinstance(end_data, dict):
                 start_time = self._parse_timestamp(start_data.get('dateTime'))
                 end_time = self._parse_timestamp(end_data.get('dateTime'))
-                
+
                 if start_time and end_time:
                     return end_time - start_time
-        
+
+        # Handle Granola's google_calendar_event format
+        if 'google_calendar_event' in self._data and isinstance(self._data['google_calendar_event'], dict):
+            gce = self._data['google_calendar_event']
+            if 'start' in gce and 'end' in gce:
+                start_data = gce['start']
+                end_data = gce['end']
+                if isinstance(start_data, dict) and isinstance(end_data, dict):
+                    start_time = self._parse_timestamp(start_data.get('dateTime'))
+                    end_time = self._parse_timestamp(end_data.get('dateTime'))
+                    if start_time and end_time:
+                        return end_time - start_time
+
         # Handle direct start_time/end_time fields (not from document lifecycle)
         start_time = None
         end_time = None
