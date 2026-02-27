@@ -42,20 +42,23 @@ class MCPTools:
 
     def _get_meetings(self, force_reload: bool = False) -> List[Meeting]:
         """
-        Get all meetings, with caching for performance.
+        Get all meetings, always reloading from cache file.
+
+        Granola updates the cache file in real-time as meetings occur,
+        so we always reload to pick up new meetings.
 
         Args:
-            force_reload: Force reload from cache file
+            force_reload: Ignored, kept for API compatibility
 
         Returns:
             List[Meeting]: All available meetings
         """
-        if self._meetings_cache is None or force_reload:
-            try:
-                meeting_data = self.parser.get_meetings()
-                self._meetings_cache = [Meeting(data) for data in meeting_data]
-            except Exception as e:
-                raise MCPToolError(f"Failed to load meetings: {e}")
+        try:
+            self.parser.reload()
+            meeting_data = self.parser.get_meetings()
+            self._meetings_cache = [Meeting(data) for data in meeting_data]
+        except Exception as e:
+            raise MCPToolError(f"Failed to load meetings: {e}")
 
         return self._meetings_cache
 
