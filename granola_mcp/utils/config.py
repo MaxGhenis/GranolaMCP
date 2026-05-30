@@ -109,8 +109,11 @@ def get_cache_path(config: Optional[Dict[str, str]] = None) -> str:
         # Expand user home directory if needed
         return os.path.expanduser(cache_path)
 
-    # Default cache path
-    default_path = "/Users/pedram/Library/Application Support/Granola/cache-v3.json"
+    # Default cache path. Modern Granola encrypts its local cache; the api
+    # backend reads documents from the API and transcripts from this file
+    # (decrypted on the fly). Legacy plaintext caches are still honored if the
+    # user points GRANOLA_CACHE_PATH at one.
+    default_path = "~/Library/Application Support/Granola/cache-v6.json.enc"
     return os.path.expanduser(default_path)
 
 

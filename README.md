@@ -24,6 +24,16 @@ GranolaMCP provides complete access to Granola.ai meeting data through multiple 
 
 ## Data Source
 
+> **2026 update (this fork):** Modern Granola encrypts its local storage and no
+> longer keeps documents in the cache (only recent transcripts). This fork adds
+> an **api backend** (the default): documents come from the Granola API using
+> the app's locally-stored token, transcripts/AI summaries are read from the
+> decrypted local cache with a lazy API fallback, and the macOS keychain is
+> touched exactly once (silently). It is strictly read-only and never refreshes
+> the token, so the desktop app's session is undisturbed. The legacy cache-file
+> behavior described below still applies with `GRANOLA_MODE=plaintext`. See
+> `CLAUDE.md` for the architecture and decryption chain.
+
 **GranolaMCP operates entirely on local cache files** - it reads meeting data directly from Granola's local cache file (`cache-v3.json`) without making any API calls to Granola's servers. This approach provides:
 
 - **🔌 No Network Dependency** - Works completely offline

@@ -57,24 +57,56 @@ The codebase follows a modular architecture with three main layers:
 
 ## Key Technical Details
 
-### Data Source Structure
-Granola cache files require double JSON parsing due to nested structure:
-```python
-data = json.loads(open("cache-v3.json").read())
-cache = json.loads(data['cache'])
-meetings = cache['state']['documents']
-transcripts = cache['state']['transcripts']
-```
+### Data Source Structure (two backends)
+
+`GranolaParser` auto-selects a backend (override with `GRANOLA_MODE`):
+
+- **api** (default, modern Granola 2026+). Granola now encrypts all local
+  storage and no longer keeps documents in the cache (only recent transcripts).
+  So documents come from the Granola HTTP API (`api.granola.ai`) using the
+  app's bearer token, which is read from the encrypted `supabase.json.enc`.
+  Transcripts come from the decrypted local cache (instant) with a lazy API
+  fallback (`/v1/get-document-transcript`); AI summaries come lazily from
+  panels (`/v1/get-document-panels`). See `core/api_client.py` and
+  `utils/granola_crypto.py`. It is **read-only** — it never refreshes the
+  token, so the desktop app's session is never disturbed.
+
+- **plaintext** (legacy). The original double-JSON cache parsing, used when
+  `GRANOLA_CACHE_PATH` points at a readable plaintext cache file:
+  ```python
+  data = json.loads(open("cache-v3.json").read())
+  cache = json.loads(data['cache'])
+  meetings = cache['state']['documents']
+  transcripts = cache['state']['transcripts']
+  ```
+
+#### Decryption chain (macOS, api backend)
+`security` reads the `Granola Safe Storage` / `Granola Key` keychain item ONCE
+(targeted, not a dump → no prompt storms; "Always Allow" makes it silent) →
+derives the Chromium OSCrypt v10 key (PBKDF2-SHA1, salt `saltysalt`) → decrypts
+`storage.dek` to the 32-byte DEK → decrypts `*.enc` (AES-256-GCM, nonce(12) ||
+ct || tag(16), optional gzip). Downstream `Meeting`/tools/CLI are unchanged:
+`get_meetings()` still returns the same document dict shape, and `Meeting`
+pulls transcripts/summaries via module-level loaders set by the parser
+(`set_transcript_loader` / `set_summary_loader`).
 
 ### Configuration
-Uses `.env` file for configuration:
+Environment variables (or `.env`):
 ```env
-GRANOLA_CACHE_PATH=/Users/pedram/Library/Application Support/Granola/cache-v3.json
+# Backend: "api" (default, modern Granola) or "plaintext" (legacy cache file)
+GRANOLA_MODE=api
+# Only for the plaintext backend — path to a decrypted/legacy cache file
+GRANOLA_CACHE_PATH=~/Library/Application Support/Granola/cache-v3.json
 GRANOLA_TIMEZONE=America/Chicago
+# api backend tuning
+GRANOLA_MAX_DOCUMENTS=500          # cap on documents fetched per load
+GRANOLA_DIR=~/Library/Application Support/Granola   # override Granola data dir
+GRANOLA_KEYCHAIN_SERVICE="Granola Safe Storage"      # safeStorage keychain item
+GRANOLA_KEYCHAIN_ACCOUNT="Granola Key"
 ```
 
 ### Dependencies
-- **Runtime**: Python 3.12+ only (no external dependencies)
+- **Runtime**: Python 3.12+ and `cryptography` (for the api backend's local decryption)
 - **Development**: pytest, black, flake8, mypy (optional, not currently configured)
 
 ### MCP Server Tools

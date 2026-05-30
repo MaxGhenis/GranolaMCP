@@ -6,9 +6,34 @@ Granola.ai meeting objects.
 """
 
 import datetime
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
 from .timezone_utils import convert_utc_to_cst
 from .transcript import Transcript
+
+
+# Optional lazy transcript provider, set by the active data source (e.g. the
+# api-backed GranolaParser). When a Meeting has no transcript attached, it asks
+# this loader for one on demand. Keeps the api backend from fetching every
+# transcript up front while still serving full transcripts for any meeting.
+_TRANSCRIPT_LOADER: Optional[Callable[[Optional[str]], Optional[Any]]] = None
+
+
+def set_transcript_loader(loader: Optional[Callable[[Optional[str]], Optional[Any]]]) -> None:
+    """Register a callable ``loader(meeting_id) -> segments | None`` for lazy transcripts."""
+    global _TRANSCRIPT_LOADER
+    _TRANSCRIPT_LOADER = loader
+
+
+# Optional lazy AI-summary provider. Modern Granola keeps the AI summary in
+# "panels" fetched per-document, so it is loaded on demand (when .summary is
+# accessed) rather than for every meeting in a list.
+_SUMMARY_LOADER: Optional[Callable[[Optional[str]], Optional[str]]] = None
+
+
+def set_summary_loader(loader: Optional[Callable[[Optional[str]], Optional[str]]]) -> None:
+    """Register a callable ``loader(meeting_id) -> summary_html | None`` for lazy AI summaries."""
+    global _SUMMARY_LOADER
+    _SUMMARY_LOADER = loader
 
 
 class Meeting:
@@ -25,6 +50,8 @@ class Meeting:
         """
         self._data = meeting_data
         self._transcript: Optional[Transcript] = None
+        self._transcript_attempted = False
+        self._summary_attempted = False
 
     @property
     def id(self) -> Optional[str]:
@@ -289,7 +316,8 @@ class Meeting:
     @property
     def transcript(self) -> Optional[Transcript]:
         """Get the meeting transcript."""
-        if self._transcript is None:
+        if self._transcript is None and not self._transcript_attempted:
+            self._transcript_attempted = True
             # Try to find transcript data
             transcript_data = None
 
@@ -302,6 +330,16 @@ class Meeting:
                     if transcript_field in self._data:
                         transcript_data = self._data[transcript_field]
                         break
+
+            # Lazily fetch from the registered loader (e.g. Granola API) if the
+            # transcript wasn't attached up front.
+            if not transcript_data and _TRANSCRIPT_LOADER is not None:
+                try:
+                    transcript_data = _TRANSCRIPT_LOADER(self.id)
+                except Exception:
+                    transcript_data = None
+                if transcript_data:
+                    self._data['transcript_data'] = transcript_data
 
             if transcript_data:
                 self._transcript = Transcript(transcript_data)
@@ -379,7 +417,18 @@ class Meeting:
                 value = self._data[summary_field]
                 if isinstance(value, str) and value.strip():
                     return value
-        
+
+        # Lazily fetch the AI summary panels (modern Granola) if nothing inline.
+        if not self._summary_attempted and _SUMMARY_LOADER is not None:
+            self._summary_attempted = True
+            try:
+                html = _SUMMARY_LOADER(self.id)
+            except Exception:
+                html = None
+            if html and html.strip():
+                self._data['ai_summary_html'] = html
+                return self.summary  # re-run; ai_summary_html branch handles conversion
+
         return None
 
     @property

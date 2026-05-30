@@ -48,7 +48,10 @@ setup(
     ],
     python_requires=">=3.12",
     install_requires=[
-        # No external dependencies - using only Python standard library
+        # Required by the api backend to decrypt modern Granola's local
+        # storage (Electron safeStorage / AES-GCM). The legacy plaintext
+        # backend still uses only the standard library.
+        "cryptography>=42.0.0",
     ],
     extras_require={
         "dev": [
