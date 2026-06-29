@@ -11,7 +11,11 @@ Stdlib-only HTTP (urllib) to keep the project's light dependency footprint.
 """
 
 import gzip
+import http.client
 import json
+import os
+import socket
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional
@@ -27,6 +31,14 @@ DEFAULT_CLIENT_HEADERS = {
 }
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back on bad/missing values."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
 class GranolaAPIError(Exception):
     """Raised when a Granola API request fails."""
 
@@ -34,43 +46,73 @@ class GranolaAPIError(Exception):
 class GranolaAPI:
     """Minimal read-only client for the Granola document API."""
 
-    def __init__(self, token_provider: Optional[Callable[[], str]] = None, timeout: int = 30):
+    # HTTP statuses worth retrying (transient server/rate-limit conditions).
+    _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+    def __init__(self, token_provider: Optional[Callable[[], str]] = None,
+                 timeout: Optional[int] = None, retries: Optional[int] = None,
+                 backoff: float = 1.5):
         self._token_provider = token_provider or get_access_token
-        self.timeout = timeout
+        # Defaults are generous and env-overridable: transcript/panel payloads are
+        # ~1 MB and slow networks (travel wifi, mobile, trains) need headroom.
+        self.timeout = timeout if timeout is not None else _env_int("GRANOLA_HTTP_TIMEOUT", 60)
+        self.retries = max(1, retries if retries is not None else _env_int("GRANOLA_HTTP_RETRIES", 4))
+        self.backoff = backoff
 
     def _request(self, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
         url = API_BASE + path
         data = json.dumps(body or {}).encode()
-        headers = {
-            "Authorization": "Bearer " + self._token_provider(),
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip",
-            **DEFAULT_CLIENT_HEADERS,
-        }
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read()
-                if resp.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
-                    raw = gzip.decompress(raw)
-                return json.loads(raw) if raw else None
-        except urllib.error.HTTPError as e:
-            detail = e.read()
+        last_err: Optional[GranolaAPIError] = None
+        for attempt in range(self.retries):
+            # Re-read the token each attempt so a mid-retry app refresh is picked up.
+            headers = {
+                "Authorization": "Bearer " + self._token_provider(),
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                **DEFAULT_CLIENT_HEADERS,
+            }
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
-                if detail[:2] == b"\x1f\x8b":
-                    detail = gzip.decompress(detail)
-                detail = detail.decode("utf-8", "replace")
-            except Exception:
-                detail = str(detail)
-            if e.code in (401, 403):
-                raise GranolaAPIError(
-                    f"Granola API auth failed (HTTP {e.code}). The cached token may be "
-                    f"stale — open the Granola app to refresh it. Detail: {detail[:200]}"
-                ) from e
-            raise GranolaAPIError(f"Granola API {path} failed (HTTP {e.code}): {detail[:300]}") from e
-        except urllib.error.URLError as e:
-            raise GranolaAPIError(f"Granola API {path} unreachable: {e.reason}") from e
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read()
+                    if resp.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
+                        raw = gzip.decompress(raw)
+                return json.loads(raw) if raw else None
+            except urllib.error.HTTPError as e:
+                detail = e.read()
+                try:
+                    if detail[:2] == b"\x1f\x8b":
+                        detail = gzip.decompress(detail)
+                    detail = detail.decode("utf-8", "replace")
+                except Exception:
+                    detail = str(detail)
+                if e.code in (401, 403):
+                    # Token problem — retrying won't help; fail fast with guidance.
+                    raise GranolaAPIError(
+                        f"Granola API auth failed (HTTP {e.code}). The cached token may be "
+                        f"stale — open the Granola app to refresh it. Detail: {detail[:200]}"
+                    ) from e
+                last_err = GranolaAPIError(
+                    f"Granola API {path} failed (HTTP {e.code}): {detail[:300]}"
+                )
+                if e.code not in self._RETRY_STATUS:
+                    raise last_err from e
+            except (urllib.error.URLError, http.client.IncompleteRead,
+                    ConnectionError, TimeoutError, socket.timeout) as e:
+                # Slow/flaky network: read timeouts, dropped connections, partial
+                # bodies (IncompleteRead). Common on travel wifi for ~1 MB payloads.
+                reason = getattr(e, "reason", e)
+                last_err = GranolaAPIError(
+                    f"Granola API {path} unreachable ({type(e).__name__}: {reason})"
+                )
+            if attempt < self.retries - 1:
+                time.sleep(self.backoff * (2 ** attempt))  # exponential backoff
+        raise GranolaAPIError(
+            f"{last_err} — gave up after {self.retries} attempts. On a slow connection, "
+            f"retry (transcripts/summaries are ~1 MB) and keep the Granola app open so the "
+            f"token stays fresh; tune GRANOLA_HTTP_TIMEOUT / GRANOLA_HTTP_RETRIES if needed."
+        ) from last_err
 
     def get_documents(self, limit: Optional[int] = None, max_documents: int = 500,
                       include_last_viewed: bool = True) -> List[Dict[str, Any]]:
