@@ -52,7 +52,17 @@ def _resolve_mode(cache_path: Optional[str]) -> str:
                 return "plaintext"
         except Exception:
             pass
-    # Prefer the supported public API when a key is available.
+    # Prefer the internal `api` backend when the DEK-free CLI token bucket is
+    # available — it's the freshest source (surfaces just-ended / in-progress
+    # meetings the official public API hasn't published yet). Fall back to the
+    # supported public API (grn_ key) otherwise; `get_meetings` degrades from
+    # `api` to `public` at runtime if the internal token can't be obtained.
+    try:
+        from .cli_token import cli_credentials_available
+        if cli_credentials_available():
+            return "api"
+    except Exception:
+        pass
     try:
         from .public_api import has_api_key
         if has_api_key():
@@ -251,11 +261,14 @@ class GranolaParser:
             # The public API has no local cache; expose an empty state shape.
             return {"state": {}}
         if self.mode == "api":
+            # Transcripts come over HTTP; the local encrypted cache is a bonus,
+            # not a requirement. If it can't be decrypted (modern Granola removed
+            # the DEK), degrade to an empty state instead of failing the CLI.
             from ..utils.granola_crypto import load_cache_state
             try:
                 return {"state": load_cache_state()}
-            except Exception as e:
-                raise GranolaParseError(f"Could not load Granola cache: {e}") from e
+            except Exception:
+                return {"state": {}}
 
         if self._cache_data is not None and not force_reload:
             return self._cache_data
@@ -327,30 +340,70 @@ class GranolaParser:
         return meetings
 
     # --------------------------------------------------------------- public
+    def _switch_to_public(self, reason: str = "") -> bool:
+        """Degrade from the internal `api` backend to the public API, if possible.
+
+        Returns True if the switch happened. Re-wires the lazy loaders so any
+        Meeting created afterward pulls transcripts/summaries from the public API.
+        """
+        if self.mode == "public":
+            return True
+        try:
+            from .public_api import has_api_key
+            if not has_api_key():
+                return False
+        except Exception:
+            return False
+        self.mode = "public"
+        self._note_cache.clear()
+        set_transcript_loader(self.fetch_transcript_public)
+        set_summary_loader(self.fetch_summary_public)
+        return True
+
     def get_meetings(self, debug: bool = False) -> List[Dict[str, Any]]:
         """Return all meetings as dicts (combined document + transcript data)."""
         if self.mode == "api":
-            return self._get_meetings_api(debug=debug)
+            try:
+                return self._get_meetings_api(debug=debug)
+            except Exception as e:
+                # Internal API/token unavailable — degrade to the public API.
+                if self._switch_to_public():
+                    if debug:
+                        print(f"DEBUG: internal api failed ({e}); using public API")
+                    return self._get_meetings_public(debug=debug)
+                raise
         if self.mode == "public":
             return self._get_meetings_public(debug=debug)
         return self._get_meetings_plaintext(debug=debug)
 
-    def get_meeting_by_id(self, meeting_id: str) -> Optional[Dict[str, Any]]:
-        # Public backend: fetch the note directly (one request), incl. transcript.
-        # Fall back to a short-id scan of the recent list for prefix matches.
-        if self.mode == "public":
-            from .public_api import note_to_meeting
-            note = self._get_note(meeting_id)
-            if note:
-                return note_to_meeting(note)
-            for meeting in self.get_meetings():
-                mid = meeting.get("id") if isinstance(meeting, dict) else None
-                if mid and str(mid).startswith(meeting_id):
-                    full = self._get_note(mid)
-                    return note_to_meeting(full) if full else meeting
-            return None
+    def _get_meeting_by_id_public(self, meeting_id: str) -> Optional[Dict[str, Any]]:
+        """Public backend: direct note fetch (one request), else short-id scan."""
+        from .public_api import note_to_meeting
+        note = self._get_note(meeting_id)
+        if note:
+            return note_to_meeting(note)
+        for meeting in self._get_meetings_public():
+            mid = meeting.get("id") if isinstance(meeting, dict) else None
+            if mid and str(mid).startswith(meeting_id):
+                full = self._get_note(mid)
+                return note_to_meeting(full) if full else meeting
+        return None
 
-        for meeting in self.get_meetings():
+    def get_meeting_by_id(self, meeting_id: str) -> Optional[Dict[str, Any]]:
+        if self.mode == "public":
+            return self._get_meeting_by_id_public(meeting_id)
+
+        if self.mode == "api":
+            try:
+                meetings = self._get_meetings_api()
+            except Exception:
+                if self._switch_to_public():
+                    return self._get_meeting_by_id_public(meeting_id)
+                raise
+        else:
+            meetings = self.get_meetings()
+
+        for meeting in meetings:
             if isinstance(meeting, dict):
                 for id_field in ("id", "meeting_id", "session_id", "uuid"):
                     if meeting.get(id_field) == meeting_id:
@@ -369,8 +422,16 @@ class GranolaParser:
                 from .public_api import has_api_key
                 return has_api_key()
             if self.mode == "api":
-                from ..utils.granola_crypto import get_dek, get_access_token
-                get_dek()
+                # Readiness = an internal-API token is obtainable. Do NOT require
+                # the local DEK (modern Granola no longer exposes it); transcripts
+                # come over HTTP, not the local cache.
+                try:
+                    from .cli_token import cli_credentials_available
+                    if cli_credentials_available():
+                        return True
+                except Exception:
+                    pass
+                from ..utils.granola_crypto import get_access_token
                 return bool(get_access_token())
             cache_data = self.load_cache()
             return isinstance(cache_data, dict) and isinstance(self.get_meetings(), list)

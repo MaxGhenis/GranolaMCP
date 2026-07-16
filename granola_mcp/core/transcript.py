@@ -35,11 +35,22 @@ class TranscriptSegment:
 
     @property
     def speaker(self) -> Optional[str]:
-        """Get the speaker name."""
-        # Try different possible speaker fields, including Granola's source field
-        for speaker_field in ['speaker', 'user', 'name', 'participant', 'source']:
+        """Get the speaker name.
+
+        Prefers a resolved name (``detected_speaker_name`` from the internal API,
+        or a ``speaker``/``name`` field) and falls back to the audio ``source``
+        label (``microphone``/``system``) only when no name is available. Empty
+        values are skipped so an empty ``detected_speaker_name`` doesn't mask the
+        source.
+        """
+        for speaker_field in ['detected_speaker_name', 'speaker', 'user', 'name',
+                              'participant', 'source']:
             if speaker_field in self._data:
-                return str(self._data[speaker_field])
+                value = self._data[speaker_field]
+                if isinstance(value, dict):
+                    value = value.get('name') or value.get('source')
+                if value not in (None, ""):
+                    return str(value)
         return None
 
     @property

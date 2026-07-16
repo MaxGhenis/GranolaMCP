@@ -23,6 +23,23 @@ from typing import Any, Callable, Dict, List, Optional
 from ..utils.granola_crypto import get_access_token
 
 API_BASE = "https://api.granola.ai"
+
+
+def default_token_provider():
+    """Pick a token source for the internal API.
+
+    Prefers the DEK-free ``com.granola.cli`` keychain bucket (refreshable via
+    WorkOS); falls back to the legacy ``supabase.json.enc`` reader (which needs
+    the — now usually unavailable — local DEK). Returns a provider object:
+    callable ``provider() -> token`` and, for the CLI bucket, ``provider.refresh()``.
+    """
+    try:
+        from .cli_token import CliTokenProvider, cli_credentials_available
+        if cli_credentials_available():
+            return CliTokenProvider()
+    except Exception:
+        pass
+    return get_access_token
 # Mirrors the desktop client so the API treats us as a normal Granola client.
 DEFAULT_CLIENT_HEADERS = {
     "User-Agent": "Granola/6 (GranolaMCP)",
@@ -52,7 +69,7 @@ class GranolaAPI:
     def __init__(self, token_provider: Optional[Callable[[], str]] = None,
                  timeout: Optional[int] = None, retries: Optional[int] = None,
                  backoff: float = 1.5):
-        self._token_provider = token_provider or get_access_token
+        self._token_provider = token_provider or default_token_provider()
         # Defaults are generous and env-overridable: transcript/panel payloads are
         # ~1 MB and slow networks (travel wifi, mobile, trains) need headroom.
         self.timeout = timeout if timeout is not None else _env_int("GRANOLA_HTTP_TIMEOUT", 60)
@@ -63,6 +80,7 @@ class GranolaAPI:
         url = API_BASE + path
         data = json.dumps(body or {}).encode()
         last_err: Optional[GranolaAPIError] = None
+        refreshed = False
         for attempt in range(self.retries):
             # Re-read the token each attempt so a mid-retry app refresh is picked up.
             headers = {
@@ -88,10 +106,23 @@ class GranolaAPI:
                 except Exception:
                     detail = str(detail)
                 if e.code in (401, 403):
-                    # Token problem — retrying won't help; fail fast with guidance.
+                    # Token rejected. If the provider can refresh (CLI bucket via
+                    # WorkOS), rotate once and retry; otherwise fail with guidance.
+                    refresh = getattr(self._token_provider, "refresh", None)
+                    if callable(refresh) and not refreshed:
+                        refreshed = True
+                        try:
+                            refresh()
+                            continue
+                        except Exception as re:
+                            raise GranolaAPIError(
+                                f"Granola API auth failed (HTTP {e.code}) and token refresh "
+                                f"failed: {re}. Detail: {detail[:200]}"
+                            ) from re
                     raise GranolaAPIError(
-                        f"Granola API auth failed (HTTP {e.code}). The cached token may be "
-                        f"stale — open the Granola app to refresh it. Detail: {detail[:200]}"
+                        f"Granola API auth failed (HTTP {e.code}). The token may be stale — "
+                        f"open the Granola app (or re-auth its CLI) to refresh it. "
+                        f"Detail: {detail[:200]}"
                     ) from e
                 last_err = GranolaAPIError(
                     f"Granola API {path} failed (HTTP {e.code}): {detail[:300]}"
