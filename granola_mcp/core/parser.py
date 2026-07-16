@@ -31,7 +31,14 @@ class GranolaParseError(Exception):
 
 
 def _resolve_mode(cache_path: Optional[str]) -> str:
-    """Pick a backend. Honors ``GRANOLA_MODE``; otherwise auto-detects."""
+    """Pick a backend. Honors ``GRANOLA_MODE``; otherwise auto-detects.
+
+    Preference order (auto): plaintext cache file → official **public** API (if
+    a ``grn_`` key is available) → legacy internal **api**. Public is favored
+    because modern Granola encrypts local storage and moved the cache key out of
+    ``storage.dek``, which breaks the internal ``api`` backend; the public API
+    needs no local decryption and is the supported, stable path.
+    """
     env = os.environ.get("GRANOLA_MODE")
     if env:
         return env.strip().lower()
@@ -45,6 +52,13 @@ def _resolve_mode(cache_path: Optional[str]) -> str:
                 return "plaintext"
         except Exception:
             pass
+    # Prefer the supported public API when a key is available.
+    try:
+        from .public_api import has_api_key
+        if has_api_key():
+            return "public"
+    except Exception:
+        pass
     return "api"
 
 
@@ -92,6 +106,10 @@ class GranolaParser:
         self._tx_cache: Dict[str, Optional[List[Dict[str, Any]]]] = {}
         self._panel_cache: Dict[str, Optional[str]] = {}
 
+        # public-backend state
+        self._public = None
+        self._note_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+
         # plaintext-backend state
         self._cache_data: Optional[Dict[str, Any]] = None
         self._raw_data: Optional[str] = None
@@ -100,6 +118,9 @@ class GranolaParser:
             # Let Meeting lazily pull transcripts / AI summaries on demand.
             set_transcript_loader(self.fetch_transcript)
             set_summary_loader(self.fetch_summary_html)
+        elif self.mode == "public":
+            set_transcript_loader(self.fetch_transcript_public)
+            set_summary_loader(self.fetch_summary_public)
 
     # ------------------------------------------------------------------ api
     def _ensure_api(self):
@@ -172,6 +193,52 @@ class GranolaParser:
             meetings.append(meeting)
         return meetings
 
+    # ---------------------------------------------------------------- public
+    def _ensure_public(self):
+        if self._public is None:
+            from .public_api import GranolaPublicAPI
+            self._public = GranolaPublicAPI()
+        return self._public
+
+    def _get_note(self, note_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Fetch and memoize a full note (with transcript) from the public API."""
+        if not note_id:
+            return None
+        if note_id in self._note_cache:
+            return self._note_cache[note_id]
+        try:
+            note = self._ensure_public().get_note(note_id, include_transcript=True)
+        except Exception:
+            note = None
+        self._note_cache[note_id] = note
+        return note
+
+    def fetch_transcript_public(self, meeting_id: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        """Lazy transcript loader for the public backend (normalized segments)."""
+        note = self._get_note(meeting_id)
+        if not note:
+            return None
+        from .public_api import normalize_transcript
+        segments = normalize_transcript(note.get("transcript"))
+        return segments or None
+
+    def fetch_summary_public(self, meeting_id: Optional[str]) -> Optional[str]:
+        """Lazy AI-summary loader for the public backend (markdown as-is)."""
+        note = self._get_note(meeting_id)
+        if not note:
+            return None
+        md = note.get("summary_markdown") or note.get("summary_text")
+        return md if isinstance(md, str) and md.strip() else None
+
+    def _get_meetings_public(self, debug: bool = False) -> List[Dict[str, Any]]:
+        api = self._ensure_public()
+        max_docs = int(os.environ.get("GRANOLA_MAX_DOCUMENTS", "500"))
+        notes = api.get_notes(max_notes=max_docs)
+        if debug:
+            print(f"DEBUG: public API returned {len(notes)} notes")
+        from .public_api import note_to_meeting
+        return [note_to_meeting(n) for n in notes if isinstance(n, dict)]
+
     # ------------------------------------------------------------- plaintext
     def load_cache(self, force_reload: bool = False) -> Dict[str, Any]:
         """Load parsed cache data.
@@ -180,6 +247,9 @@ class GranolaParser:
         (transcripts + UI state) wrapped as ``{"state": ...}`` for
         compatibility with tools that introspect the cache directly.
         """
+        if self.mode == "public":
+            # The public API has no local cache; expose an empty state shape.
+            return {"state": {}}
         if self.mode == "api":
             from ..utils.granola_crypto import load_cache_state
             try:
@@ -261,9 +331,25 @@ class GranolaParser:
         """Return all meetings as dicts (combined document + transcript data)."""
         if self.mode == "api":
             return self._get_meetings_api(debug=debug)
+        if self.mode == "public":
+            return self._get_meetings_public(debug=debug)
         return self._get_meetings_plaintext(debug=debug)
 
     def get_meeting_by_id(self, meeting_id: str) -> Optional[Dict[str, Any]]:
+        # Public backend: fetch the note directly (one request), incl. transcript.
+        # Fall back to a short-id scan of the recent list for prefix matches.
+        if self.mode == "public":
+            from .public_api import note_to_meeting
+            note = self._get_note(meeting_id)
+            if note:
+                return note_to_meeting(note)
+            for meeting in self.get_meetings():
+                mid = meeting.get("id") if isinstance(meeting, dict) else None
+                if mid and str(mid).startswith(meeting_id):
+                    full = self._get_note(mid)
+                    return note_to_meeting(full) if full else meeting
+            return None
+
         for meeting in self.get_meetings():
             if isinstance(meeting, dict):
                 for id_field in ("id", "meeting_id", "session_id", "uuid"):
@@ -279,6 +365,9 @@ class GranolaParser:
     def validate_cache_structure(self) -> bool:
         """Cheap readiness check (no network for the api backend)."""
         try:
+            if self.mode == "public":
+                from .public_api import has_api_key
+                return has_api_key()
             if self.mode == "api":
                 from ..utils.granola_crypto import get_dek, get_access_token
                 get_dek()
@@ -295,6 +384,16 @@ class GranolaParser:
             "meeting_count": 0,
             "valid_structure": False,
         }
+        if self.mode == "public":
+            from .public_api import PUBLIC_API_BASE
+            info["api_base"] = PUBLIC_API_BASE
+            info["readable"] = info["valid_structure"] = self.validate_cache_structure()
+            try:
+                info["meeting_count"] = len(self.get_meetings())
+                info["valid_structure"] = True
+            except Exception:
+                pass
+            return info
         if self.mode == "api":
             from ..utils.granola_crypto import granola_dir
             info["granola_dir"] = granola_dir()
@@ -324,7 +423,10 @@ class GranolaParser:
         """Force a refresh of cached state."""
         self._tx_cache.clear()
         self._panel_cache.clear()
+        self._note_cache.clear()
         self._local_tx = None
+        if self.mode == "public":
+            return {"state": {}}
         if self.mode == "api":
             from ..utils import granola_crypto
             granola_crypto._DEK_CACHE = None  # re-derive in case the app re-keyed

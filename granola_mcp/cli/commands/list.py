@@ -320,29 +320,8 @@ class ListCommand:
             if meeting.start_time:
                 date_str = meeting.start_time.strftime("%m/%d %H:%M")
 
-            # Try to get actual meeting duration
-            duration_str = muted("Unknown")
-            
-            # First try the meeting's duration property (uses start/end times)
-            if meeting.duration:
-                duration_str = format_duration(meeting.duration.total_seconds())
-            else:
-                # Try to get duration from transcript timing
-                if meeting.has_transcript():
-                    try:
-                        transcript = meeting.transcript
-                        segments = transcript.segments
-                        if segments and len(segments) > 0:
-                            first = segments[0]
-                            last = segments[-1]
-                            if hasattr(last, 'end_time') and hasattr(first, 'start_time') and last.end_time and first.start_time:
-                                duration_seconds = last.end_time - first.start_time
-                                if duration_seconds > 60:  # Only show if > 1 minute
-                                    duration_str = format_duration(duration_seconds)
-                    except:
-                        pass
-
-            # Get transcript word count
+            # Get transcript word count (also loads the transcript so the
+            # duration calc below can use its timestamps).
             transcript_str = muted("--")
             if meeting.has_transcript():
                 transcript = meeting.transcript
@@ -352,6 +331,28 @@ class ListCommand:
                         transcript_str = f"{word_count // 1000:.1f}k"
                     else:
                         transcript_str = str(word_count)
+
+            # Try to get actual meeting duration
+            duration_str = muted("Unknown")
+
+            # First try the meeting's duration property (uses start/end times).
+            if meeting.duration:
+                duration_str = format_duration(meeting.duration.total_seconds())
+            else:
+                # Fall back to transcript timing (relative segment seconds).
+                if meeting.has_transcript():
+                    try:
+                        transcript = meeting.transcript
+                        segments = transcript.segments
+                        if segments and len(segments) > 0:
+                            first = segments[0]
+                            last = segments[-1]
+                            if last.end_time is not None and first.start_time is not None:
+                                duration_seconds = last.end_time - first.start_time
+                                if duration_seconds > 60:  # Only show if > 1 minute
+                                    duration_str = format_duration(duration_seconds)
+                    except Exception:
+                        pass
 
             # Get AI summary word count
             summary_str = muted("--")
