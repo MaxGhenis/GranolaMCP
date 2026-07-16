@@ -57,19 +57,37 @@ The codebase follows a modular architecture with three main layers:
 
 ## Key Technical Details
 
-### Data Source Structure (two backends)
+### Data Source Structure (three backends, all HTTP)
 
-`GranolaParser` auto-selects a backend (override with `GRANOLA_MODE`):
+`GranolaParser` auto-selects a backend (override with `GRANOLA_MODE`). Both API
+backends read Granola over HTTP — no local decryption. This matters because
+Granola desktop **v7.427.0 (2026-07-16) removed `storage.dek` and encrypted
+`granola.db` (SQLCipher)**, killing the old local-cache/DEK path.
 
-- **api** (default, modern Granola 2026+). Granola now encrypts all local
-  storage and no longer keeps documents in the cache (only recent transcripts).
-  So documents come from the Granola HTTP API (`api.granola.ai`) using the
-  app's bearer token, which is read from the encrypted `supabase.json.enc`.
-  Transcripts come from the decrypted local cache (instant) with a lazy API
-  fallback (`/v1/get-document-transcript`); AI summaries come lazily from
-  panels (`/v1/get-document-panels`). See `core/api_client.py` and
-  `utils/granola_crypto.py`. It is **read-only** — it never refreshes the
-  token, so the desktop app's session is never disturbed.
+- **api** (default when the CLI token bucket exists; PRIMARY, in-progress
+  capable). Documents/transcripts come from the internal Granola HTTP API
+  (`api.granola.ai`: `/v2/get-documents`, `/v1/get-document-transcript`,
+  `/v1/get-document-panels`). The bearer token comes DEK-free from the macOS
+  keychain bucket **`com.granola.cli` / `credentials`** (`{refreshToken,
+  accessToken, clientId}` — a WorkOS session the desktop app keeps fresh). Read
+  the token read-only in the common case; on expiry/401 it refreshes via WorkOS
+  (`POST api.workos.com/user_management/authenticate`, public client, no secret)
+  with a **rotation-safe** atomic keychain write-back (separate-process readback
+  verify + 0600 recovery file). Required headers: `User-Agent: Granola/6
+  (GranolaMCP)`, `X-Client-Version: 6.0.0`. See `core/cli_token.py` +
+  `core/api_client.py`. **This is the only backend that reads just-ended /
+  in-progress meetings** (segments carry `is_final`, `detected_speaker_name`,
+  `source`); it surfaces a meeting ~1.5h before the public API.
+
+- **public** (fallback; finished meetings only). The official, supported,
+  versioned API (`public-api.granola.ai`: `GET /v1/notes`, `GET
+  /v1/notes/{id}?include=transcript`) with a long-lived `grn_` key from
+  `$GRANOLA_API_KEY` or keychain service `GRANOLA_API_KEY`. Paginates via
+  `page_size` (≤30) + `has_more`/`cursor`. Read-only, no rotation, stable across
+  app updates — but only returns notes that already have a generated AI summary +
+  transcript (post-meeting lag; NOT in-progress). The `grn_` key is NOT valid for
+  the internal `api.granola.ai` endpoints. See `core/public_api.py`.
+  `get_meetings` degrades `api → public` at runtime if the internal token dies.
 
 - **plaintext** (legacy). The original double-JSON cache parsing, used when
   `GRANOLA_CACHE_PATH` points at a readable plaintext cache file:
@@ -80,33 +98,38 @@ The codebase follows a modular architecture with three main layers:
   transcripts = cache['state']['transcripts']
   ```
 
-#### Decryption chain (macOS, api backend)
-`security` reads the `Granola Safe Storage` / `Granola Key` keychain item ONCE
-(targeted, not a dump → no prompt storms; "Always Allow" makes it silent) →
-derives the Chromium OSCrypt v10 key (PBKDF2-SHA1, salt `saltysalt`) → decrypts
-`storage.dek` to the 32-byte DEK → decrypts `*.enc` (AES-256-GCM, nonce(12) ||
-ct || tag(16), optional gzip). Downstream `Meeting`/tools/CLI are unchanged:
-`get_meetings()` still returns the same document dict shape, and `Meeting`
-pulls transcripts/summaries via module-level loaders set by the parser
-(`set_transcript_loader` / `set_summary_loader`).
+Downstream `Meeting`/tools/CLI are backend-agnostic: `get_meetings()` returns the
+same document dict shape, and `Meeting` pulls transcripts/summaries via
+module-level loaders set by the parser (`set_transcript_loader` /
+`set_summary_loader`).
+
+#### Legacy decryption chain (macOS) — DEAD as of v7.427.0
+`utils/granola_crypto.py` (keychain `Granola Safe Storage` → OSCrypt v10 →
+`storage.dek` → 32-byte DEK → decrypt `*.enc`) no longer works: `storage.dek` is
+gone and the cache DEK moved behind SQLCipher. Kept only as a fallback token
+reader for `supabase.json.enc` on machines where it still exists. **Do not chase
+the DEK** — it is not derivable from the 16-byte keychain secret.
 
 ### Configuration
 Environment variables (or `.env`):
 ```env
-# Backend: "api" (default, modern Granola) or "plaintext" (legacy cache file)
+# Backend: auto (api if CLI-token bucket present, else public if grn_ key, else
+# plaintext). Override with "api" | "public" | "plaintext".
 GRANOLA_MODE=api
-# Only for the plaintext backend — path to a decrypted/legacy cache file
-GRANOLA_CACHE_PATH=~/Library/Application Support/Granola/cache-v3.json
 GRANOLA_TIMEZONE=America/Chicago
-# api backend tuning
-GRANOLA_MAX_DOCUMENTS=500          # cap on documents fetched per load
-GRANOLA_DIR=~/Library/Application Support/Granola   # override Granola data dir
-GRANOLA_KEYCHAIN_SERVICE="Granola Safe Storage"      # safeStorage keychain item
-GRANOLA_KEYCHAIN_ACCOUNT="Granola Key"
+GRANOLA_MAX_DOCUMENTS=500          # cap on documents/notes fetched per load
+# public backend: grn_ key (env wins over keychain service GRANOLA_API_KEY)
+GRANOLA_API_KEY=grn_...
+GRANOLA_NOTE_CACHE_TTL=60          # public detail-cache TTL (seconds)
+# api (internal) backend: com.granola.cli keychain bucket (auto); WorkOS host
+GRANOLA_WORKOS_HOST=https://api.workos.com
+# plaintext backend only:
+GRANOLA_CACHE_PATH=~/Library/Application Support/Granola/cache-v3.json
 ```
 
 ### Dependencies
-- **Runtime**: Python 3.12+ and `cryptography` (for the api backend's local decryption)
+- **Runtime**: Python 3.12+ (`cryptography` only needed for the legacy plaintext/
+  DEK fallback; both HTTP backends are stdlib-only).
 - **Development**: pytest, black, flake8, mypy (optional, not currently configured)
 
 ### MCP Server Tools
