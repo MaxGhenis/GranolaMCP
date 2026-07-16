@@ -21,6 +21,7 @@ from ..formatters.charts import (
     create_bar_chart, create_histogram, create_line_chart,
     create_time_pattern_chart, create_day_pattern_chart, create_summary_box
 )
+from ._hydration import disclose_source_cap, hydrate_meetings
 
 
 class StatsCommand:
@@ -178,6 +179,24 @@ class StatsCommand:
         except ValueError as e:
             print_error(f"Invalid date format: {e}")
             return []
+
+    def _request_date_bounds(self) -> tuple[Optional[str], Optional[str]]:
+        """Return parsed ISO bounds for remote list filtering, when valid."""
+        if not self.args.last and not self.args.from_date:
+            return None, None
+        try:
+            if self.args.last:
+                start_date = parse_date(self.args.last)
+                end_date = datetime.datetime.now(start_date.tzinfo)
+            else:
+                start_date, end_date = get_date_range(
+                    self.args.from_date,
+                    self.args.to_date,
+                )
+            return start_date.isoformat(), end_date.isoformat()
+        except ValueError:
+            # The local filter emits the user-facing validation error.
+            return None, None
 
     def _filter_meetings_by_folder(self, meetings: List[Meeting]) -> List[Meeting]:
         """
@@ -636,8 +655,15 @@ class StatsCommand:
         """
         try:
             # Load meetings
-            meeting_data = self.parser.get_meetings()
+            created_after, created_before = self._request_date_bounds()
+            request_filters = {}
+            if created_after:
+                request_filters["created_after"] = created_after
+            if created_before:
+                request_filters["created_before"] = created_before
+            meeting_data = self.parser.get_meetings(**request_filters)
             meetings = [Meeting(data) for data in meeting_data]
+            disclose_source_cap(self.parser, len(meetings))
 
             if self.args.verbose:
                 print_info(f"Loaded {len(meetings)} meetings from cache")
@@ -647,6 +673,37 @@ class StatsCommand:
 
             if self.args.verbose and len(meetings) != len(meeting_data):
                 print_info(f"Filtered to {len(meetings)} meetings based on date criteria")
+
+            needs_remote_detail = (
+                self.parser.mode in ("api", "public")
+                and (
+                    self.args.duration_distribution
+                    or self.args.word_analysis
+                    or self.args.summary
+                    or self.args.all
+                    or not any((
+                        self.args.meetings_per_day,
+                        self.args.meetings_per_week,
+                        self.args.meetings_per_month,
+                        self.args.duration_distribution,
+                        self.args.participant_frequency,
+                        self.args.time_patterns,
+                        self.args.word_analysis,
+                        self.args.summary,
+                        self.args.all,
+                    ))
+                    or (
+                        self.parser.mode == "public"
+                        and (self.args.folder or self.args.participant_frequency)
+                    )
+                )
+            )
+            if needs_remote_detail:
+                meetings = hydrate_meetings(
+                    self.parser,
+                    meetings,
+                    include_summary=False,
+                )
 
             # Apply folder filters
             original_count = len(meetings)

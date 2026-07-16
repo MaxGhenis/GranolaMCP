@@ -7,13 +7,13 @@ from meetings within a date range, organized by day into separate text files.
 
 import argparse
 import os
-import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from ...core.parser import GranolaParser
 from ...core.meeting import Meeting
 from ...core.transcript import Transcript, TranscriptSegment
-from ..formatters.colors import print_error, print_info, print_success
+from ..formatters.colors import print_error, print_info, print_success, print_warning
+from ._hydration import disclose_source_cap, hydrate_meetings
 from ...utils.date_parser import get_date_range, parse_date
 
 
@@ -125,6 +125,30 @@ class CollectCommand:
         Returns:
             List of segments that are from microphone source
         """
+        source_segments = [
+            segment for segment in transcript.segments
+            if hasattr(segment, '_data') and segment._data.get('source')
+        ]
+        sources = {
+            str(segment._data.get('source')).strip().lower()
+            for segment in source_segments
+        }
+        if not sources:
+            print_warning(
+                "Skipping a transcript without source metadata because it "
+                "cannot identify which speaker is you."
+            )
+            return []
+        # Some clients label every speaker as microphone. In that shape,
+        # source cannot identify the account owner's words safely, regardless
+        # of whether the response also supplies diarization labels.
+        if sources == {'microphone'}:
+            print_warning(
+                "Skipping an all-microphone transcript because the "
+                "source metadata cannot identify which speaker is you."
+            )
+            return []
+
         my_segments = []
         
         for segment in transcript.segments:
@@ -241,9 +265,11 @@ class CollectCommand:
             os.makedirs(self.args.output_dir, exist_ok=True)
 
             # Get meetings in date range
+            all_meeting_data = self.parser.get_meetings()
+            disclose_source_cap(self.parser, len(all_meeting_data))
             meetings = []
-            for meeting_data in self.parser.get_meetings():
-                meeting = Meeting(meeting_data)
+            for item in all_meeting_data:
+                meeting = Meeting(item)
                 if meeting.start_time and start_date <= meeting.start_time <= end_date:
                     meetings.append(meeting)
 
@@ -253,6 +279,12 @@ class CollectCommand:
 
             if self.args.verbose:
                 print_info(f"Found {len(meetings)} meetings")
+
+            meetings = hydrate_meetings(
+                self.parser,
+                meetings,
+                include_summary=False,
+            )
 
             # Group segments by date
             date_groups = self._group_segments_by_date(meetings)

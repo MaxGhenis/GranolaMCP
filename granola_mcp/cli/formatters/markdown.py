@@ -143,7 +143,13 @@ def format_summary_section(meeting: Meeting) -> str:
     lines = []
     lines.append("## AI Summary")
     lines.append("")
-    lines.append(escape_markdown(summary))
+    raw_summary = meeting.raw_data.get("summary_markdown")
+    if isinstance(raw_summary, str) and raw_summary.strip():
+        # The public API explicitly labels this field as Markdown. Preserve its
+        # headings, lists, links, and emphasis instead of escaping it as prose.
+        lines.append(raw_summary)
+    else:
+        lines.append(escape_markdown(summary))
     lines.append("")
 
     return "\n".join(lines)
@@ -226,7 +232,9 @@ def format_transcript_section(meeting: Meeting, include_speakers: bool = True,
                 timestamp_prefix = f"*[{minutes:02d}:{seconds:02d}]* "
 
             # Add the text
-            if include_speakers and speaker:
+            if not include_speakers:
+                lines.append(f"{timestamp_prefix}{escape_markdown(text)}")
+            elif speaker:
                 lines.append(f"{timestamp_prefix}{escape_markdown(text)}")
             else:
                 lines.append(f"{timestamp_prefix}**{escape_markdown(speaker or 'Unknown')}:** {escape_markdown(text)}")

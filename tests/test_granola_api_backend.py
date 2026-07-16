@@ -61,14 +61,18 @@ def test_participants_from_people_list_and_empty():
     assert _participants_from_people({}) == []
 
 
-def test_resolve_mode():
+def test_resolve_mode(monkeypatch):
+    monkeypatch.delenv("GRANOLA_MODE", raising=False)
+    monkeypatch.setattr(
+        "granola_mcp.core.cli_token.cli_credentials_available", lambda: False
+    )
+    monkeypatch.setattr(
+        "granola_mcp.core.public_api.has_api_key", lambda: False
+    )
     assert _resolve_mode("/x/cache-v6.json.enc") == "api"
     assert _resolve_mode(None) == "api"
-    os.environ["GRANOLA_MODE"] = "plaintext"
-    try:
-        assert _resolve_mode("/x/cache-v6.json.enc") == "plaintext"
-    finally:
-        del os.environ["GRANOLA_MODE"]
+    monkeypatch.setenv("GRANOLA_MODE", "plaintext")
+    assert _resolve_mode("/x/cache-v6.json.enc") == "plaintext"
 
 
 def test_get_summary_html_skips_link_panels():

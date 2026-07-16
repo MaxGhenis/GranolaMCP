@@ -7,6 +7,7 @@ including date ranges, title search, and participant filtering.
 
 import argparse
 import datetime
+import sys
 from typing import List, Optional, Dict, Any
 from ...core.parser import GranolaParser
 from ...core.meeting import Meeting
@@ -16,6 +17,7 @@ from ..formatters.colors import (
     format_meeting_id, print_error, print_info, muted
 )
 from ..formatters.table import Table, TableAlignment
+from ._hydration import disclose_source_cap, hydrate_meetings
 
 
 class ListCommand:
@@ -150,6 +152,24 @@ class ListCommand:
         except ValueError as e:
             print_error(f"Invalid date format: {e}")
             return []
+
+    def _request_date_bounds(self) -> tuple[Optional[str], Optional[str]]:
+        """Return parsed ISO bounds for remote list filtering, when valid."""
+        if not self.args.last and not self.args.from_date:
+            return None, None
+        try:
+            if self.args.last:
+                start_date = parse_date(self.args.last)
+                end_date = datetime.datetime.now(start_date.tzinfo)
+            else:
+                start_date, end_date = get_date_range(
+                    self.args.from_date,
+                    self.args.to_date,
+                )
+            return start_date.isoformat(), end_date.isoformat()
+        except ValueError:
+            # The local filter emits the user-facing validation error.
+            return None, None
 
     def _filter_meetings_by_title(self, meetings: List[Meeting]) -> List[Meeting]:
         """
@@ -457,8 +477,18 @@ class ListCommand:
         try:
             # Load meetings with debug flag if verbose is enabled
             debug_flag = getattr(self.args, 'verbose', False)
-            meeting_data = self.parser.get_meetings(debug=debug_flag)
+            created_after, created_before = self._request_date_bounds()
+            request_filters = {}
+            if created_after:
+                request_filters["created_after"] = created_after
+            if created_before:
+                request_filters["created_before"] = created_before
+            meeting_data = self.parser.get_meetings(
+                debug=debug_flag,
+                **request_filters,
+            )
             meetings = [Meeting(data) for data in meeting_data]
+            disclose_source_cap(self.parser, len(meetings))
 
             if self.args.verbose:
                 print_info(f"Loaded {len(meetings)} meetings from cache")
@@ -466,6 +496,30 @@ class ListCommand:
             # Apply filters
             meetings = self._filter_meetings_by_date(meetings)
             meetings = self._filter_meetings_by_title(meetings)
+
+            # Public list rows omit detail-only participants/folders, and both
+            # remote backends may need transcript detail for duration sorting.
+            needs_detail_before_sort = (
+                self.parser.mode in ("api", "public")
+                and (
+                    self.args.sort_by == 'duration'
+                    or (
+                        self.parser.mode == "public"
+                        and (
+                            self.args.participant
+                            or self.args.folder
+                            or self.args.sort_by == 'participants'
+                        )
+                    )
+                )
+            )
+            if needs_detail_before_sort:
+                meetings = hydrate_meetings(
+                    self.parser,
+                    meetings,
+                    include_summary=self.args.format == 'table',
+                )
+
             meetings = self._filter_meetings_by_participant(meetings)
             meetings = self._filter_meetings_by_folder(meetings)
 
@@ -474,7 +528,25 @@ class ListCommand:
 
             # Apply limit
             if self.args.limit and self.args.limit > 0:
+                unbounded_count = len(meetings)
                 meetings = meetings[:self.args.limit]
+                if len(meetings) < unbounded_count:
+                    print_info(
+                        f"Displaying {len(meetings)} of {unbounded_count} matching "
+                        "meetings because --limit was set.",
+                        file=sys.stderr,
+                    )
+
+            if (
+                self.args.format in ('table', 'simple')
+                and self.parser.mode in ("api", "public")
+                and not needs_detail_before_sort
+            ):
+                meetings = hydrate_meetings(
+                    self.parser,
+                    meetings,
+                    include_summary=self.args.format == 'table',
+                )
 
             # Format output
             if self.args.format == 'simple':

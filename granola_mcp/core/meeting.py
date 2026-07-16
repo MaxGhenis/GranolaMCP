@@ -68,7 +68,9 @@ class Meeting:
         # Try different possible title fields
         for title_field in ['title', 'name', 'subject', 'meeting_name', 'summary']:
             if title_field in self._data:
-                return str(self._data[title_field])
+                value = self._data[title_field]
+                if value not in (None, "") and str(value).strip():
+                    return str(value)
         return None
 
     @property
@@ -180,28 +182,36 @@ class Meeting:
         if not transcript_data:
             return None
         
-        # Find segments with absolute timestamps
-        segments_with_start = [s for s in transcript_data if 'start_timestamp' in s]
-        segments_with_end = [s for s in transcript_data if 'end_timestamp' in s]
-        
-        if segments_with_start and segments_with_end:
+        # Parse before comparing so malformed values and mixed ISO offsets do
+        # not poison duration calculation.
+        start_times = [
+            self._parse_timestamp(segment.get('start_timestamp'))
+            for segment in transcript_data
+            if isinstance(segment, dict)
+        ]
+        end_times = [
+            self._parse_timestamp(segment.get('end_timestamp'))
+            for segment in transcript_data
+            if isinstance(segment, dict)
+        ]
+        start_times = [value for value in start_times if value is not None]
+        end_times = [value for value in end_times if value is not None]
+
+        if start_times and end_times:
             try:
-                # Get first start and last end timestamps
-                first_segment = min(segments_with_start, key=lambda x: x['start_timestamp'])
-                last_segment = max(segments_with_end, key=lambda x: x['end_timestamp'])
-                
-                first_time = self._parse_timestamp(first_segment['start_timestamp'])
-                last_time = self._parse_timestamp(last_segment['end_timestamp'])
-                
-                if first_time and last_time:
-                    return last_time - first_time
-            except (KeyError, ValueError, TypeError):
+                return max(end_times) - min(start_times)
+            except TypeError:
                 pass
         
         # Fallback: Try relative timestamps (startSec, etc.)
         max_relative_time = 0
         for segment in transcript_data:
-            for time_field in ['startSec', 'start_time', 'offset']:
+            if not isinstance(segment, dict):
+                continue
+            for time_field in [
+                'endSec', 'end_time', 'endTime', 'end',
+                'startSec', 'start_time', 'offset',
+            ]:
                 if time_field in segment:
                     try:
                         time_val = float(segment[time_field])
@@ -278,16 +288,11 @@ class Meeting:
         if not timestamp_str:
             return None
         try:
-            # Handle ISO 8601 format with Z suffix
-            if isinstance(timestamp_str, str) and timestamp_str.endswith('Z'):
-                timestamp_str = timestamp_str[:-1] + '+00:00'
-            return datetime.datetime.fromisoformat(timestamp_str)
-        except:
-            # Fallback to existing timezone utility
-            try:
-                return convert_utc_to_cst(timestamp_str)
-            except:
-                return None
+            # The shared converter treats naive values as UTC and returns one
+            # consistent timezone, so aware/naive values remain comparable.
+            return convert_utc_to_cst(timestamp_str)
+        except (ValueError, TypeError, OSError, OverflowError):
+            return None
 
     @property
     def participants(self) -> List[str]:
@@ -337,7 +342,11 @@ class Meeting:
                 try:
                     transcript_data = _TRANSCRIPT_LOADER(self.id)
                 except Exception:
-                    transcript_data = None
+                    # Transient remote failures must remain visible and
+                    # retryable on the same Meeting instance. Backend loaders
+                    # that intentionally degrade absence already return None.
+                    self._transcript_attempted = False
+                    raise
                 if transcript_data:
                     self._data['transcript_data'] = transcript_data
 
@@ -424,7 +433,10 @@ class Meeting:
             try:
                 html = _SUMMARY_LOADER(self.id)
             except Exception:
-                html = None
+                # Match transcript loading: do not turn a transient provider
+                # failure into permanent "no summary" state.
+                self._summary_attempted = False
+                raise
             if html and html.strip():
                 self._data['ai_summary_html'] = html
                 return self.summary  # re-run; ai_summary_html branch handles conversion

@@ -208,6 +208,10 @@ class ShowCommand:
         """
         notes = meeting.human_notes
         if not notes or not notes.strip():
+            if self.parser.mode == "public":
+                print_info(
+                    "Human notes are not exposed by the public API backend."
+                )
             return
 
         print_section("Notes")
@@ -310,7 +314,9 @@ class ShowCommand:
                 timestamp_prefix = muted(f"[{minutes:02d}:{seconds:02d}] ")
 
             # Display the text
-            if show_speakers and speaker:
+            if not show_speakers:
+                print(f"{timestamp_prefix}{text}")
+            elif speaker:
                 print(f"  {timestamp_prefix}{text}")
             else:
                 speaker_name = speaker or "Unknown"

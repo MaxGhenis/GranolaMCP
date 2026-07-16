@@ -7,9 +7,12 @@ including search, retrieval, statistics, and export functionality.
 
 import json
 import datetime
+import os
 import statistics
+import time
 from collections import defaultdict, Counter
-from typing import Dict, Any, List, Optional, Union
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any, List, Optional, Tuple, Union
 from ..core.parser import GranolaParser, GranolaParseError
 from ..core.meeting import Meeting
 from ..utils.date_parser import parse_date, get_date_range
@@ -39,28 +42,155 @@ class MCPTools:
         """
         self.parser = parser
         self._meetings_cache: Optional[List[Meeting]] = None
+        self._meetings_cache_key: Optional[
+            Tuple[Optional[str], Optional[str]]
+        ] = None
+        self._meetings_cache_loaded_at = 0.0
+        try:
+            self._meetings_cache_ttl = max(
+                0.0, float(os.environ.get("GRANOLA_MCP_CACHE_TTL", "5"))
+            )
+        except ValueError:
+            self._meetings_cache_ttl = 5.0
+        self._last_hydration_count = 0
 
-    def _get_meetings(self, force_reload: bool = False) -> List[Meeting]:
+    def _get_meetings(
+        self,
+        force_reload: bool = False,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
+        cache_key: Optional[Tuple[Optional[str], Optional[str]]] = None,
+    ) -> List[Meeting]:
         """
-        Get all meetings, always reloading from cache file.
+        Get meetings with a short-lived source cache.
 
-        Granola updates the cache file in real-time as meetings occur,
-        so we always reload to pick up new meetings.
+        Public/API sources already fetch fresh list data, while plaintext needs
+        an explicit reload after the short TTL. Reusing this cache avoids
+        clearing memoized public note details on every related MCP tool call.
 
         Args:
-            force_reload: Ignored, kept for API compatibility
+            force_reload: Bypass the short-lived cache
 
         Returns:
             List[Meeting]: All available meetings
         """
+        source_key = cache_key or (created_after, created_before)
+        now = time.monotonic()
+        if (
+            not force_reload
+            and self._meetings_cache is not None
+            and self._meetings_cache_key == source_key
+            and now - self._meetings_cache_loaded_at <= self._meetings_cache_ttl
+        ):
+            return self._meetings_cache
+
         try:
-            self.parser.reload()
-            meeting_data = self.parser.get_meetings()
+            # Only the plaintext backend needs reload() to observe file changes.
+            # Public/API list methods fetch from their sources directly, and an
+            # automatic reload would discard reusable detail memoization.
+            if force_reload or (
+                self._meetings_cache is not None
+                and getattr(self.parser, "mode", None) == "plaintext"
+            ):
+                self.parser.reload()
+
+            if getattr(self.parser, "mode", None) == "public":
+                meeting_data = self.parser.get_meetings(
+                    created_after=created_after,
+                    created_before=created_before,
+                )
+            else:
+                meeting_data = self.parser.get_meetings()
             self._meetings_cache = [Meeting(data) for data in meeting_data]
+            self._meetings_cache_key = source_key
+            self._meetings_cache_loaded_at = time.monotonic()
         except Exception as e:
             raise MCPToolError(f"Failed to load meetings: {e}")
 
         return self._meetings_cache
+
+    def _get_single_meeting(self, meeting_id: str) -> Meeting:
+        """Resolve one meeting through the parser's backend-aware ID path."""
+        try:
+            # Legacy plaintext cache files can change while the MCP server is
+            # running. Preserve the former per-tool refresh behavior there,
+            # without discarding API/public detail caches.
+            if getattr(self.parser, "mode", None) == "plaintext":
+                self.parser.reload()
+            meeting_data = self.parser.get_meeting_by_id(meeting_id)
+        except GranolaParseError as e:
+            raise MCPToolError(str(e)) from e
+        if not meeting_data:
+            raise MCPToolError(f"Meeting not found: {meeting_id}")
+        return Meeting(meeting_data)
+
+    def _hydrate_public_meetings(self, meetings: List[Meeting]) -> List[Meeting]:
+        """Fetch complete public notes concurrently with bounded fan-out."""
+        self._last_hydration_count = 0
+        if getattr(self.parser, "mode", None) != "public" or not meetings:
+            return meetings
+
+        indexed = [(index, meeting.id) for index, meeting in enumerate(meetings)]
+        indexed = [(index, meeting_id) for index, meeting_id in indexed if meeting_id]
+        if not indexed:
+            return meetings
+
+        hydrated = list(meetings)
+        max_workers = min(4, len(indexed))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                index: executor.submit(self._get_single_meeting, meeting_id)
+                for index, meeting_id in indexed
+            }
+            for index, _meeting_id in indexed:
+                hydrated[index] = futures[index].result()
+
+        self._last_hydration_count = len(indexed)
+        return hydrated
+
+    def _public_retrieval_info(self) -> Optional[Dict[str, Any]]:
+        """Describe public detail fan-out and configured list bounds."""
+        if getattr(self.parser, "mode", None) != "public":
+            return None
+        try:
+            source_max_notes = int(
+                os.environ.get("GRANOLA_MAX_DOCUMENTS", "500")
+            )
+        except ValueError:
+            source_max_notes = 500
+        return {
+            "detail_notes_hydrated": self._last_hydration_count,
+            "max_detail_concurrency": 4,
+            "max_request_starts_per_second": 5,
+            "source_max_notes": source_max_notes,
+            "source_truncated": bool(
+                getattr(self.parser, "last_public_list_truncated", False)
+            ),
+        }
+
+    def _with_public_retrieval(
+        self, response: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Attach public source bounds to a bulk-analysis response."""
+        retrieval = self._public_retrieval_info()
+        if retrieval:
+            response["retrieval"] = retrieval
+        return response
+
+    def _date_bounds(
+        self,
+        from_date: Optional[str],
+        to_date: Optional[str],
+    ) -> Tuple[datetime.datetime, datetime.datetime]:
+        """Parse optional date filters into an inclusive datetime range."""
+        cst_tz = get_cst_timezone()
+        if from_date and to_date:
+            return get_date_range(from_date, to_date)
+        if from_date:
+            return parse_date(from_date), datetime.datetime.now(cst_tz)
+        if to_date:
+            return datetime.datetime.min.replace(tzinfo=cst_tz), parse_date(to_date)
+        raise ValueError("At least one date boundary is required")
 
     def _filter_meetings_by_date(self, meetings: List[Meeting],
                                 from_date: Optional[str] = None,
@@ -80,20 +210,7 @@ class MCPTools:
             return meetings
 
         try:
-            cst_tz = get_cst_timezone()
-            
-            if from_date and to_date:
-                start_date, end_date = get_date_range(from_date, to_date)
-            elif from_date:
-                start_date = parse_date(from_date)
-                end_date = datetime.datetime.now(cst_tz)
-            else:
-                # Only to_date specified
-                if to_date:
-                    end_date = parse_date(to_date)
-                    start_date = datetime.datetime.min.replace(tzinfo=cst_tz)
-                else:
-                    return meetings
+            start_date, end_date = self._date_bounds(from_date, to_date)
 
             filtered_meetings = []
             for meeting in meetings:
@@ -104,6 +221,31 @@ class MCPTools:
 
         except ValueError as e:
             raise MCPToolError(f"Invalid date format: {e}")
+
+    def _get_meetings_for_dates(
+        self,
+        from_date: Optional[str],
+        to_date: Optional[str],
+    ) -> List[Meeting]:
+        """Load meetings with public date filters pushed to the list request."""
+        self._last_hydration_count = 0
+        created_after = None
+        created_before = None
+        if getattr(self.parser, "mode", None) == "public" and (from_date or to_date):
+            start_date, end_date = self._date_bounds(from_date, to_date)
+            if from_date:
+                created_after = start_date.isoformat()
+            if to_date:
+                created_before = end_date.isoformat()
+
+        meetings = self._get_meetings(
+            created_after=created_after,
+            created_before=created_before,
+            cache_key=(from_date, to_date),
+        )
+        if from_date or to_date:
+            meetings = self._filter_meetings_by_date(meetings, from_date, to_date)
+        return meetings
 
     def _filter_meetings_by_participant(self, meetings: List[Meeting],
                                       participant: str) -> List[Meeting]:
@@ -181,6 +323,7 @@ class MCPTools:
 
             # Take the requested number of most recent meetings
             recent_meetings = meetings_with_dates[:count]
+            recent_meetings = self._hydrate_public_meetings(recent_meetings)
 
             # Format results (reuse the same format as search_meetings)
             results = []
@@ -196,7 +339,7 @@ class MCPTools:
                 }
                 results.append(result)
 
-            return {
+            response = {
                 "total_found": len(results),
                 "meetings": results,
                 "filters_applied": {
@@ -205,6 +348,10 @@ class MCPTools:
                     "total_meetings_in_cache": len(meetings)
                 }
             }
+            retrieval = self._public_retrieval_info()
+            if retrieval:
+                response["retrieval"] = retrieval
+            return response
 
         except Exception as e:
             raise MCPToolError(f"Failed to get recent meetings: {e}")
@@ -250,15 +397,33 @@ class MCPTools:
             Dict containing search results
         """
         try:
-            meetings = self._get_meetings()
-
             # Apply default 3-day lookback if no date filters specified
             if not from_date and not to_date:
                 from_date = "3d"
 
+            created_after = None
+            created_before = None
+            if getattr(self.parser, "mode", None) == "public":
+                start_date, end_date = self._date_bounds(from_date, to_date)
+                if from_date:
+                    created_after = start_date.isoformat()
+                if to_date:
+                    created_before = end_date.isoformat()
+
+            meetings = self._get_meetings(
+                created_after=created_after,
+                created_before=created_before,
+                cache_key=(from_date, to_date),
+            )
+
             # Apply filters
             if from_date or to_date:
                 meetings = self._filter_meetings_by_date(meetings, from_date, to_date)
+
+            hydrated = False
+            if getattr(self.parser, "mode", None) == "public" and (participant or query):
+                meetings = self._hydrate_public_meetings(meetings)
+                hydrated = True
 
             if participant:
                 meetings = self._filter_meetings_by_participant(meetings, participant)
@@ -267,8 +432,14 @@ class MCPTools:
                 meetings = self._search_meetings_by_query(meetings, query)
 
             # Apply limit
+            total_before_limit = len(meetings)
+            result_limit_truncated = False
             if limit and limit > 0:
+                result_limit_truncated = len(meetings) > limit
                 meetings = meetings[:limit]
+
+            if not hydrated:
+                meetings = self._hydrate_public_meetings(meetings)
 
             # Format results
             results = []
@@ -284,8 +455,9 @@ class MCPTools:
                 }
                 results.append(result)
 
-            return {
+            response = {
                 "total_found": len(results),
+                "total_before_limit": total_before_limit,
                 "meetings": results,
                 "filters_applied": {
                     "query": query,
@@ -295,6 +467,11 @@ class MCPTools:
                     "limit": limit
                 }
             }
+            retrieval = self._public_retrieval_info()
+            if retrieval:
+                retrieval["result_limit_truncated"] = result_limit_truncated
+                response["retrieval"] = retrieval
+            return response
 
         except Exception as e:
             raise MCPToolError(f"Search failed: {e}")
@@ -310,17 +487,7 @@ class MCPTools:
             Dict containing complete meeting details
         """
         try:
-            meetings = self._get_meetings()
-
-            # Find the meeting
-            meeting = None
-            for m in meetings:
-                if m.id == meeting_id:
-                    meeting = m
-                    break
-
-            if not meeting:
-                raise MCPToolError(f"Meeting not found: {meeting_id}")
+            meeting = self._get_single_meeting(meeting_id)
 
             # Build complete meeting data
             result = {
@@ -367,17 +534,7 @@ class MCPTools:
             Dict containing transcript data
         """
         try:
-            meetings = self._get_meetings()
-
-            # Find the meeting
-            meeting = None
-            for m in meetings:
-                if m.id == meeting_id:
-                    meeting = m
-                    break
-
-            if not meeting:
-                raise MCPToolError(f"Meeting not found: {meeting_id}")
+            meeting = self._get_single_meeting(meeting_id)
 
             if not meeting.has_transcript():
                 raise MCPToolError(f"Meeting has no transcript: {meeting_id}")
@@ -434,17 +591,7 @@ class MCPTools:
             Dict containing meeting notes and summary
         """
         try:
-            meetings = self._get_meetings()
-
-            # Find the meeting
-            meeting = None
-            for m in meetings:
-                if m.id == meeting_id:
-                    meeting = m
-                    break
-
-            if not meeting:
-                raise MCPToolError(f"Meeting not found: {meeting_id}")
+            meeting = self._get_single_meeting(meeting_id)
 
             result = {
                 "meeting_id": meeting_id,
@@ -502,11 +649,8 @@ class MCPTools:
             Dict containing participant list and statistics
         """
         try:
-            meetings = self._get_meetings()
-
-            # Apply date filters
-            if from_date or to_date:
-                meetings = self._filter_meetings_by_date(meetings, from_date, to_date)
+            meetings = self._get_meetings_for_dates(from_date, to_date)
+            meetings = self._hydrate_public_meetings(meetings)
 
             # Count participant occurrences
             participant_counts = Counter()
@@ -534,7 +678,7 @@ class MCPTools:
                     "meetings": participant_meetings[participant]
                 })
 
-            return {
+            response = {
                 "total_participants": len(participants),
                 "total_meetings_analyzed": len(meetings),
                 "participants": participants,
@@ -544,6 +688,7 @@ class MCPTools:
                     "min_meetings": min_meetings
                 }
             }
+            return self._with_public_retrieval(response)
 
         except Exception as e:
             raise MCPToolError(f"Failed to list participants: {e}")
@@ -563,24 +708,24 @@ class MCPTools:
             Dict containing statistical analysis
         """
         try:
-            meetings = self._get_meetings()
+            meetings = self._get_meetings_for_dates(from_date, to_date)
 
-            # Apply date filters
-            if from_date or to_date:
-                meetings = self._filter_meetings_by_date(meetings, from_date, to_date)
+            if stat_type in ("summary", "duration", "participants"):
+                meetings = self._hydrate_public_meetings(meetings)
 
             if stat_type == "summary":
-                return self._get_summary_statistics(meetings)
+                response = self._get_summary_statistics(meetings)
             elif stat_type == "frequency":
-                return self._get_frequency_statistics(meetings)
+                response = self._get_frequency_statistics(meetings)
             elif stat_type == "duration":
-                return self._get_duration_statistics(meetings)
+                response = self._get_duration_statistics(meetings)
             elif stat_type == "participants":
-                return self._get_participant_statistics(meetings)
+                response = self._get_participant_statistics(meetings)
             elif stat_type == "patterns":
-                return self._get_pattern_statistics(meetings)
+                response = self._get_pattern_statistics(meetings)
             else:
                 raise MCPToolError(f"Unknown statistics type: {stat_type}")
+            return self._with_public_retrieval(response)
 
         except MCPToolError:
             raise
@@ -774,17 +919,7 @@ class MCPTools:
             Dict containing markdown content
         """
         try:
-            meetings = self._get_meetings()
-
-            # Find the meeting
-            meeting = None
-            for m in meetings:
-                if m.id == meeting_id:
-                    meeting = m
-                    break
-
-            if not meeting:
-                raise MCPToolError(f"Meeting not found: {meeting_id}")
+            meeting = self._get_single_meeting(meeting_id)
 
             # Use the existing markdown export function
             markdown_content = export_meeting_to_markdown(
@@ -822,22 +957,22 @@ class MCPTools:
             Dict containing pattern analysis
         """
         try:
-            meetings = self._get_meetings()
+            meetings = self._get_meetings_for_dates(from_date, to_date)
 
-            # Apply date filters
-            if from_date or to_date:
-                meetings = self._filter_meetings_by_date(meetings, from_date, to_date)
+            if pattern_type in ("participants", "duration"):
+                meetings = self._hydrate_public_meetings(meetings)
 
             if pattern_type == "time":
-                return self._analyze_time_patterns(meetings)
+                response = self._analyze_time_patterns(meetings)
             elif pattern_type == "frequency":
-                return self._analyze_frequency_patterns(meetings)
+                response = self._analyze_frequency_patterns(meetings)
             elif pattern_type == "participants":
-                return self._analyze_participant_patterns(meetings)
+                response = self._analyze_participant_patterns(meetings)
             elif pattern_type == "duration":
-                return self._analyze_duration_patterns(meetings)
+                response = self._analyze_duration_patterns(meetings)
             else:
                 raise MCPToolError(f"Unknown pattern type: {pattern_type}")
+            return self._with_public_retrieval(response)
 
         except MCPToolError:
             raise

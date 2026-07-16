@@ -62,6 +62,14 @@ class JsonCommand:
             int: Exit code (0 for success)
         """
         try:
+            if self.parser.mode in ("api", "public"):
+                print_error(
+                    f"Raw cache unavailable in the {self.parser.mode} backend. "
+                    "Use 'granola list', 'granola show', or 'granola export' "
+                    "for normalized meeting data."
+                )
+                return 1
+
             # Load the inner cache data (already parsed from the embedded JSON string)
             cache_data = self.parser.load_cache()
 

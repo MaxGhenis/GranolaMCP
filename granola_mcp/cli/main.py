@@ -219,23 +219,52 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Determine cache path
     cache_path = args.cache_path or get_cache_path()
 
-    if args.verbose:
-        print(f"Using cache file: {cache_path}")
-
-    # Validate cache file
-    if not validate_cache_file(cache_path):
-        return 1
-
     # Create parser
     try:
         granola_parser = GranolaParser(cache_path)
 
-        # Test that we can load the cache
-        granola_parser.load_cache()
-
-        if args.verbose:
-            cache_info = granola_parser.get_cache_info()
-            print(f"Cache loaded successfully: {cache_info['meeting_count']} meetings found")
+        if granola_parser.mode == "plaintext":
+            if args.verbose:
+                print(f"Using cache file: {cache_path}")
+            # Legacy plaintext mode retains its existing file validation and
+            # eager parse so malformed caches fail before command dispatch.
+            if not validate_cache_file(cache_path):
+                return 1
+            granola_parser.load_cache()
+            if args.verbose:
+                cache_info = granola_parser.get_cache_info()
+                print(
+                    "Cache loaded successfully: "
+                    f"{cache_info['meeting_count']} meetings found"
+                )
+        elif granola_parser.mode in ("api", "public"):
+            # Remote backends do not depend on Granola's local cache. This is a
+            # cheap credential/configuration check and intentionally makes no
+            # meeting-list request.
+            if not granola_parser.validate_cache_structure():
+                if granola_parser.mode == "public":
+                    message = (
+                        "No valid Granola public API key is configured. Set "
+                        "GRANOLA_API_KEY to a grn_ key or add one to the keychain."
+                    )
+                else:
+                    message = (
+                        "No Granola CLI token is configured for the internal API "
+                        "backend. Sign in with Granola CLI or configure the public API."
+                    )
+                print(colorize(f"Error: {message}", Colors.RED), file=sys.stderr)
+                return 1
+            if args.verbose:
+                print(f"Using {granola_parser.mode} backend (local cache not required)")
+        else:
+            print(
+                colorize(
+                    f"Error: Unsupported Granola backend: {granola_parser.mode}",
+                    Colors.RED,
+                ),
+                file=sys.stderr,
+            )
+            return 1
 
     except GranolaParseError as e:
         print(colorize(f"Error parsing cache file: {e}", Colors.RED), file=sys.stderr)
